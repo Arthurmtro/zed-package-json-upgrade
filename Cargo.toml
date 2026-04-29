@@ -1,0 +1,17 @@
+[workspace]
+members = []
+# `lsp` is the native LSP binary; excluded so `cargo build --target wasm32-wasip2` skips it.
+exclude = ["lsp"]
+
+[package]
+name = "zed-package-json-upgrade"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+zed_extension_api = "0.7.0"
