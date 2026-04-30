@@ -1,8 +1,8 @@
 id = "package-json-upgrade"
 name = "Package.json Upgrade"
-version = "0.0.7"
+version = "0.0.8"
 schema_version = 1
-authors = ["Arthur Monteiro <arthur@belorder.com>"]
+authors = ["Arthur Monteiro <arthurmtro@gmail.com>"]
 description = "Show available npm updates inline in package.json with quick-fix code actions to upgrade."
 repository = "https://github.com/Arthurmtro/zed-package-json-upgrade"
 

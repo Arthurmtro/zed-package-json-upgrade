@@ -9,10 +9,12 @@ Features:
   - 🔴 major behind
   - 🟡 minor behind
   - 🟢 patch behind
-- **Diagnostics**:
+- **Diagnostics** are reserved for genuine problems:
   - `Error` (red squiggle) — invalid semver in the version string.
   - `Warning` (yellow squiggle) — package not found in the npm registry.
-  - `Hint` (no squiggle, sidebar marker only) — outdated dependency. The full upgrade tier is encoded in the inlay hint emoji, not in the diagnostic, so the file stays free of squiggle noise on perfectly valid but outdated deps.
+  - Outdated dependencies do *not* emit a diagnostic. The upgrade tier is communicated entirely by the colored inlay hint, so a file with many outdated deps stays free of squiggle noise.
+
+The "outdated" check compares the literal pinned version (the `X.Y.Z` written in the file, ignoring `^`/`~` etc.) against the registry's `dist-tags.latest`. This means `^19.0.0` still flags as outdated when latest is `19.5.0`, even though the caret range allows it — matching the VS Code package-json-upgrade behaviour.
 - **Completions** inside the version string: typing `^`, `~`, `.`, or `"` lists the available versions for that package, with `latest` tagged.
 - **Hover** on a version string shows the package description, latest version, license, homepage, and changelog link.
 - **Quick-fix code actions** (Zed default `cmd-.` / `ctrl-.`):

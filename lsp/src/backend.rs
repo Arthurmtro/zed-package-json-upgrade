@@ -88,30 +88,7 @@ impl Backend {
                     message: format!("Package \"{}\" not found in npm registry", dep.name),
                     ..Default::default()
                 });
-                continue;
             }
-            let range = dep.range.as_ref().expect("range checked above");
-            let Some(latest) = &pkg.latest else { continue };
-            if range.satisfies(latest) {
-                continue;
-            }
-            if version_ignored(&dep.name, latest, &settings) {
-                continue;
-            }
-            let kind = upgrade_kind(current_pinned(&dep.range_str).as_ref(), latest);
-            let label = match kind {
-                "major" => "Major",
-                "minor" => "Minor",
-                _ => "Patch",
-            };
-            out.push(Diagnostic {
-                range: dep.value_range,
-                severity: Some(DiagnosticSeverity::HINT),
-                code: Some(NumberOrString::String(format!("upgrade-{kind}:{}", dep.name))),
-                source: Some("package-json-upgrade".into()),
-                message: format!("{label} update available: {} → {latest}", dep.range_str),
-                ..Default::default()
-            });
         }
         out
     }
@@ -129,9 +106,9 @@ impl Backend {
             if is_ignored(&dep.name, &settings) {
                 continue;
             }
-            let Some(range) = dep.range.as_ref() else {
+            if dep.range.is_none() {
                 continue;
-            };
+            }
             let Some(pkg) = self.registry.fetch(&dep.name).await else {
                 continue;
             };
@@ -139,13 +116,16 @@ impl Backend {
                 continue;
             }
             let Some(latest) = &pkg.latest else { continue };
-            if range.satisfies(latest) {
+            let Some(current) = current_pinned(&dep.range_str) else {
+                continue;
+            };
+            if &current >= latest {
                 continue;
             }
             if version_ignored(&dep.name, latest, &settings) {
                 continue;
             }
-            let kind = upgrade_kind(current_pinned(&dep.range_str).as_ref(), latest);
+            let kind = upgrade_kind(Some(&current), latest);
             let marker = match kind {
                 "major" => "🔴",
                 "minor" => "🟡",
@@ -530,9 +510,9 @@ impl LanguageServer for Backend {
                     if is_ignored(&dep.name, &settings) {
                         continue;
                     }
-                    let Some(range) = dep.range.as_ref() else {
+                    if dep.range.is_none() {
                         continue;
-                    };
+                    }
                     let Some(pkg) = self.registry.fetch(&dep.name).await else {
                         continue;
                     };
@@ -540,7 +520,10 @@ impl LanguageServer for Backend {
                         continue;
                     }
                     let Some(latest) = pkg.latest else { continue };
-                    if range.satisfies(&latest) {
+                    let Some(current) = current_pinned(&dep.range_str) else {
+                        continue;
+                    };
+                    if current >= latest {
                         continue;
                     }
                     if version_ignored(&dep.name, &latest, &settings) {
