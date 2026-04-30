@@ -9,6 +9,7 @@ pub struct Settings {
     pub ignore_versions: HashMap<String, String>,
     pub check_sections: Vec<String>,
     pub show_updates: bool,
+    pub audit: bool,
 }
 
 impl Default for Settings {
@@ -18,6 +19,7 @@ impl Default for Settings {
             ignore_versions: HashMap::new(),
             check_sections: vec!["dependencies".into(), "devDependencies".into()],
             show_updates: true,
+            audit: true,
         }
     }
 }

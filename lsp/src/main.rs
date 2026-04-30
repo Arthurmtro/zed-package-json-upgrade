@@ -1,3 +1,4 @@
+mod audit;
 mod backend;
 mod document;
 mod registry;

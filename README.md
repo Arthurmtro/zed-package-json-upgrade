@@ -5,20 +5,23 @@ Inspired by the VS Code extension [`package-json-upgrade`](https://marketplace.v
 
 Features:
 
-- **Inlay hint** after each outdated dependency, color-coded by upgrade size:
+- **Inlay hint** after each dependency, color-coded by upgrade size:
   - 🔴 major behind
   - 🟡 minor behind
   - 🟢 patch behind
+  - `⚠ Nc:Nh:Nm:Nl` appended when the pinned version has known security advisories (counts of critical / high / moderate / low)
 - **Diagnostics** for genuine problems only:
-  - `Error` (red squiggle) — invalid semver in the version string.
-  - `Warning` (yellow squiggle) — package not found in the npm registry.
+  - `Error` (red squiggle) — invalid semver in the version string, or critical/high security advisory affecting the pinned version.
+  - `Warning` (yellow squiggle) — package not found in the npm registry, or moderate security advisory.
+  - `Information` — low security advisory.
   - Outdated dependencies do not emit a diagnostic; the colored inlay hint already conveys the upgrade tier, and reserving squiggles for real errors keeps the file readable when many deps happen to be behind latest.
 - **Completions** inside the version string: typing `^`, `~`, `.`, or `"` lists the available versions for that package, with `latest` tagged.
-- **Hover** on a version string shows the package description, latest version, license, homepage, and changelog link.
+- **Hover** on a version string shows the package description, latest version, license, homepage, changelog link, and a per-advisory list when CVEs apply to the pinned version.
 - **Quick-fix code actions** (Zed default `cmd-.` / `ctrl-.`):
   - **Do patch / minor / major upgrade to `<latest>`**
   - **Open homepage**
   - **Open changelog**
+  - **Update to first non-vulnerable version** (when audit advisories apply to the pinned version)
   - **Update all dependencies (patch / minor / major)** (document-wide quick-fix; pick the safety tier you want)
 - **Parallel registry prefetch** on open/change with a per-process concurrency cap (8 in-flight requests). Subsequent code actions, hovers, and completions are served from a 1-hour in-memory cache.
 
@@ -61,7 +64,8 @@ In Zed `settings.json`:
           "@types/node": ">18"
         },
         "checkSections": ["dependencies", "devDependencies", "peerDependencies"],
-        "showUpdates": true
+        "showUpdates": true,
+        "audit": true
       }
     }
   }
@@ -74,6 +78,7 @@ In Zed `settings.json`:
 | `ignoreVersions` | `{ [name]: semverRange }` | `{}` | Hide latest versions matching the range. Useful to pin a major. |
 | `checkSections` | `string[]` | `["dependencies", "devDependencies"]` | Which top-level sections to scan. |
 | `showUpdates` | `boolean` | `true` | Disable to silence the extension globally. |
+| `audit` | `boolean` | `true` | Query [OSV.dev](https://osv.dev) for security advisories on the pinned version of each dependency. Set to `false` to disable audit network calls and CVE markers entirely. |
 
 ## Publishing to the Zed extension registry
 
