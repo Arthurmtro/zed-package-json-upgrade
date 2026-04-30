@@ -1,8 +1,10 @@
 mod audit;
 mod backend;
+mod commands;
 mod document;
 mod registry;
 mod settings;
+mod views;
 
 use tower_lsp::{LspService, Server};
 
