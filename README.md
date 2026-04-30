@@ -5,7 +5,7 @@ Inspired by the VS Code extension [`package-json-upgrade`](https://marketplace.v
 
 Features:
 
-- **Inlay hint** after each dependency, listing every distinct upgrade tier available — e.g. ` 🟢 17.0.2 · 🟡 17.9.5 · 🔴 19.5.7` for `^17.0.0` when patch / minor / major targets all differ. Tiers that resolve to the same version are de-duplicated, so a dep with only a major bump available shows just `🔴 X.Y.Z`. A `⚠ Nc:Nh:Nm:Nl` suffix is appended when the pinned version has known security advisories (counts of critical / high / moderate / low).
+- **Inlay hint** after each dependency, listing every distinct upgrade tier available — e.g. ` 🟢 17.0.2 · 🟡 17.9.5 · 🔴 19.5.7` for `^17.0.0` when patch / minor / major targets all differ. Tiers that resolve to the same version are de-duplicated, so a dep with only a major bump available shows just `🔴 X.Y.Z`. A security badge is appended when the pinned version has known advisories — `🚨 N vulns` for any critical, `‼ N` for any high, `⚠ N` for moderate-only, `ℹ N` for low-only. Hover over the version string for the per-advisory list (id, summary, fix version).
 - **Diagnostics** for genuine problems only:
   - `Error` (red squiggle) — invalid semver in the version string, or critical/high security advisory affecting the pinned version.
   - `Warning` (yellow squiggle) — package not found in the npm registry, or moderate security advisory.

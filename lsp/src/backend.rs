@@ -211,20 +211,18 @@ impl Backend {
                 .filter(|a| !a.advisories.is_empty())
                 .map(|a| {
                     let (crit, high, mod_, low) = a.counts();
-                    let mut parts = Vec::new();
-                    if crit > 0 {
-                        parts.push(format!("{crit}c"));
-                    }
-                    if high > 0 {
-                        parts.push(format!("{high}h"));
-                    }
-                    if mod_ > 0 {
-                        parts.push(format!("{mod_}m"));
-                    }
-                    if low > 0 {
-                        parts.push(format!("{low}l"));
-                    }
-                    format!(" ⚠ {}", parts.join(":"))
+                    let total = crit + high + mod_ + low;
+                    let badge = if crit > 0 {
+                        "🚨"
+                    } else if high > 0 {
+                        "‼"
+                    } else if mod_ > 0 {
+                        "⚠"
+                    } else {
+                        "ℹ"
+                    };
+                    let suffix = if total == 1 { "vuln" } else { "vulns" };
+                    format!(" {badge} {total} {suffix}")
                 });
 
             let (text, kind, tooltip) = match (label, cve_suffix) {
