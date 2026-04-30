@@ -174,22 +174,37 @@ impl Backend {
             } else {
                 None
             };
-            let label = match (pkg.latest.as_ref(), current.as_ref()) {
-                (Some(latest), Some(c)) if c < latest => {
-                    if version_ignored(&dep.name, latest, &settings) {
-                        None
-                    } else {
-                        let kind = upgrade_kind(Some(c), latest);
-                        let marker = match kind {
-                            "major" => "🔴",
-                            "minor" => "🟡",
-                            _ => "🟢",
-                        };
-                        Some((format!(" {marker} {latest}"), kind))
+            let label = current.as_ref().and_then(|c| {
+                let mut emitted: Vec<String> = Vec::new();
+                let mut parts: Vec<String> = Vec::new();
+                for (tier, marker) in [("patch", "🟢"), ("minor", "🟡"), ("major", "🔴")] {
+                    let Some(target) = pick_tier_target(&pkg.versions, c, tier) else {
+                        continue;
+                    };
+                    if &target <= c {
+                        continue;
                     }
+                    if version_ignored(&dep.name, &target, &settings) {
+                        continue;
+                    }
+                    let target_str = target.to_string();
+                    if emitted.contains(&target_str) {
+                        continue;
+                    }
+                    emitted.push(target_str.clone());
+                    parts.push(format!("{marker} {target_str}"));
                 }
-                _ => None,
-            };
+                if parts.is_empty() {
+                    None
+                } else {
+                    let preferred = pkg
+                        .latest
+                        .as_ref()
+                        .map(|l| upgrade_kind(Some(c), l))
+                        .unwrap_or("major");
+                    Some((format!(" {}", parts.join(" · ")), preferred))
+                }
+            });
 
             let cve_suffix = audit
                 .as_ref()
