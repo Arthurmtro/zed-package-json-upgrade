@@ -98,12 +98,18 @@ impl Backend {
             if version_ignored(&dep.name, latest, &settings) {
                 continue;
             }
+            let kind = upgrade_kind(current_pinned(&dep.range_str).as_ref(), latest);
+            let (severity, label) = match kind {
+                "major" => (DiagnosticSeverity::ERROR, "Major"),
+                "minor" => (DiagnosticSeverity::WARNING, "Minor"),
+                _ => (DiagnosticSeverity::HINT, "Patch"),
+            };
             out.push(Diagnostic {
                 range: dep.value_range,
-                severity: Some(DiagnosticSeverity::HINT),
-                code: Some(NumberOrString::String(format!("upgrade:{}", dep.name))),
+                severity: Some(severity),
+                code: Some(NumberOrString::String(format!("upgrade-{kind}:{}", dep.name))),
                 source: Some("package-json-upgrade".into()),
-                message: format!("{} → {}", dep.range_str, latest),
+                message: format!("{label} update available: {} → {latest}", dep.range_str),
                 ..Default::default()
             });
         }
