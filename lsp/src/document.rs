@@ -94,6 +94,24 @@ pub fn upgrade_kind(current: Option<&Version>, target: &Version) -> &'static str
     }
 }
 
+/// Highest stable version that fits inside `tier` relative to `current`:
+/// * `patch` — same `major.minor`, higher patch
+/// * `minor` — same major, higher minor or patch
+/// * `major` — absolute latest stable
+pub fn pick_tier_target(versions: &[Version], current: &Version, tier: &str) -> Option<Version> {
+    let mut stable = versions.iter().filter(|v| !v.is_prerelease());
+    match tier {
+        "patch" => stable
+            .find(|v| v.major == current.major && v.minor == current.minor && *v > current)
+            .cloned(),
+        "minor" => stable
+            .find(|v| v.major == current.major && *v > current)
+            .cloned(),
+        "major" => stable.next().cloned(),
+        _ => None,
+    }
+}
+
 pub fn position_in_range(p: Position, r: LspRange) -> bool {
     (p.line > r.start.line || (p.line == r.start.line && p.character >= r.start.character))
         && (p.line < r.end.line || (p.line == r.end.line && p.character <= r.end.character))

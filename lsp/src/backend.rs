@@ -10,17 +10,18 @@ use tower_lsp::jsonrpc::Result as LspResult;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
-use crate::audit::{AdvisorySeverity, AuditResult, Auditor};
+use crate::audit::{Advisory, AdvisorySeverity, AuditResult, Auditor};
 use crate::document::{
-    current_pinned, parse_package_json, position_in_range, split_prefix, upgrade_kind, DepEntry,
-    DocState,
+    current_pinned, parse_package_json, pick_tier_target, position_in_range, split_prefix,
+    upgrade_kind, DepEntry, DocState,
 };
-use crate::registry::{changelog_url, PackageStatus, Registry};
+use crate::registry::{changelog_url, CachedPackage, PackageStatus, Registry};
 use crate::settings::Settings;
 
 const CMD_OPEN_URL: &str = "package-json-upgrade.openUrl";
 const CMD_UPDATE_ALL: &str = "package-json-upgrade.updateAll";
 const COMPLETION_LIMIT: usize = 60;
+const TIERS: [&str; 3] = ["patch", "minor", "major"];
 
 pub struct Backend {
     client: Client,
@@ -44,17 +45,20 @@ impl Backend {
     async fn ingest(&self, uri: Url, text: &str) {
         let settings = self.settings.read().await.clone();
         let doc = parse_package_json(text, &settings.check_sections);
-        let queries: Vec<(String, Option<nodejs_semver::Version>)> = doc
+        let queries: Vec<(String, Option<Version>)> = doc
             .deps
             .iter()
             .map(|d| (d.name.clone(), current_pinned(&d.range_str)))
             .collect();
         self.docs.insert(uri.clone(), doc);
+
         join_all(queries.iter().map(|(n, _)| self.registry.fetch(n))).await;
         if settings.audit {
-            join_all(queries.iter().filter_map(|(n, v)| {
-                v.as_ref().map(|version| self.auditor.audit(n, version))
-            }))
+            join_all(
+                queries
+                    .iter()
+                    .filter_map(|(n, v)| v.as_ref().map(|c| self.auditor.audit(n, c))),
+            )
             .await;
         }
         self.refresh(uri).await;
@@ -65,250 +69,123 @@ impl Backend {
         self.client.publish_diagnostics(uri, diags, None).await;
     }
 
+    /// Fetch the registry record + (optionally) the audit record for a dep.
+    /// Returns `None` when the dep should be skipped wholesale.
+    async fn fetch_dep(
+        &self,
+        dep: &DepEntry,
+        want_audit: bool,
+    ) -> Option<(CachedPackage, Option<AuditResult>)> {
+        let pkg = self.registry.fetch(&dep.name).await?;
+        if pkg.status != PackageStatus::Found {
+            return None;
+        }
+        let audit = match (want_audit, current_pinned(&dep.range_str)) {
+            (true, Some(current)) => self.auditor.audit(&dep.name, &current).await,
+            _ => None,
+        };
+        Some((pkg, audit))
+    }
+
     async fn diagnostics_for(&self, uri: &Url) -> Vec<Diagnostic> {
         let Some(doc) = self.docs.get(uri).map(|d| d.clone()) else {
-            return vec![];
+            return Vec::new();
         };
         let settings = self.settings.read().await.clone();
         if !settings.show_updates {
-            return vec![];
+            return Vec::new();
         }
+
         let mut out = Vec::new();
         for dep in &doc.deps {
-            if is_ignored(&dep.name, &settings) {
-                continue;
-            }
-            if dep.range.is_none() {
-                out.push(Diagnostic {
-                    range: dep.value_range,
-                    severity: Some(DiagnosticSeverity::ERROR),
-                    code: Some(NumberOrString::String("invalid-semver".into())),
-                    source: Some("package-json-upgrade".into()),
-                    message: format!("Invalid semver range: \"{}\"", dep.range_str),
-                    ..Default::default()
-                });
-                continue;
-            }
-            let Some(pkg) = self.registry.fetch(&dep.name).await else {
-                continue;
-            };
-            if pkg.status == PackageStatus::NotFound {
-                out.push(Diagnostic {
-                    range: dep.value_range,
-                    severity: Some(DiagnosticSeverity::WARNING),
-                    code: Some(NumberOrString::String("not-found".into())),
-                    source: Some("package-json-upgrade".into()),
-                    message: format!("Package \"{}\" not found in npm registry", dep.name),
-                    ..Default::default()
-                });
-                continue;
-            }
-            if !settings.audit {
-                continue;
-            }
-            let Some(current) = current_pinned(&dep.range_str) else {
-                continue;
-            };
-            let Some(audit) = self.auditor.audit(&dep.name, &current).await else {
-                continue;
-            };
-            for adv in &audit.advisories {
-                let severity = match adv.severity {
-                    AdvisorySeverity::Critical | AdvisorySeverity::High => {
-                        DiagnosticSeverity::ERROR
-                    }
-                    AdvisorySeverity::Moderate => DiagnosticSeverity::WARNING,
-                    _ => DiagnosticSeverity::INFORMATION,
-                };
-                let mut message = format!("[{}] {}", adv.id, adv.summary);
-                if let Some(fix) = &adv.fixed_in {
-                    message.push_str(&format!(" — fixed in {fix}"));
-                }
-                out.push(Diagnostic {
-                    range: dep.value_range,
-                    severity: Some(severity),
-                    code: Some(NumberOrString::String(adv.id.clone())),
-                    code_description: adv
-                        .url
-                        .as_deref()
-                        .and_then(|u| Url::parse(u).ok())
-                        .map(|href| CodeDescription { href }),
-                    source: Some("package-json-upgrade/audit".into()),
-                    message,
-                    ..Default::default()
-                });
-            }
+            out.extend(self.dep_diagnostics(dep, &settings).await);
         }
         out
     }
 
+    async fn dep_diagnostics(&self, dep: &DepEntry, settings: &Settings) -> Vec<Diagnostic> {
+        if is_ignored(&dep.name, settings) {
+            return Vec::new();
+        }
+        if dep.range.is_none() {
+            return vec![invalid_semver_diagnostic(dep)];
+        }
+        let Some(pkg) = self.registry.fetch(&dep.name).await else {
+            return Vec::new();
+        };
+        if pkg.status == PackageStatus::NotFound {
+            return vec![not_found_diagnostic(dep)];
+        }
+        if !settings.audit {
+            return Vec::new();
+        }
+        let Some(current) = current_pinned(&dep.range_str) else {
+            return Vec::new();
+        };
+        let Some(audit) = self.auditor.audit(&dep.name, &current).await else {
+            return Vec::new();
+        };
+        audit
+            .advisories
+            .iter()
+            .map(|adv| advisory_diagnostic(dep, adv))
+            .collect()
+    }
+
     async fn inlay_hints_for(&self, uri: &Url) -> Vec<InlayHint> {
         let Some(doc) = self.docs.get(uri).map(|d| d.clone()) else {
-            return vec![];
+            return Vec::new();
         };
         let settings = self.settings.read().await.clone();
         if !settings.show_updates {
-            return vec![];
+            return Vec::new();
         }
+
         let mut hints = Vec::new();
         for dep in &doc.deps {
-            if is_ignored(&dep.name, &settings) {
-                continue;
+            if let Some(hint) = self.dep_inlay_hint(dep, &settings).await {
+                hints.push(hint);
             }
-            if dep.range.is_none() {
-                continue;
-            }
-            let Some(pkg) = self.registry.fetch(&dep.name).await else {
-                continue;
-            };
-            if pkg.status != PackageStatus::Found {
-                continue;
-            }
-            let current = current_pinned(&dep.range_str);
-            let audit = if settings.audit {
-                if let Some(c) = current.as_ref() {
-                    self.auditor.audit(&dep.name, c).await
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            let label = current.as_ref().and_then(|c| {
-                let mut emitted: Vec<String> = Vec::new();
-                let mut parts: Vec<String> = Vec::new();
-                for (tier, marker) in [("patch", "🟢"), ("minor", "🟡"), ("major", "🔴")] {
-                    let Some(target) = pick_tier_target(&pkg.versions, c, tier) else {
-                        continue;
-                    };
-                    if &target <= c {
-                        continue;
-                    }
-                    if version_ignored(&dep.name, &target, &settings) {
-                        continue;
-                    }
-                    let target_str = target.to_string();
-                    if emitted.contains(&target_str) {
-                        continue;
-                    }
-                    emitted.push(target_str.clone());
-                    parts.push(format!("{marker} {target_str}"));
-                }
-                if parts.is_empty() {
-                    None
-                } else {
-                    let preferred = pkg
-                        .latest
-                        .as_ref()
-                        .map(|l| upgrade_kind(Some(c), l))
-                        .unwrap_or("major");
-                    Some((format!(" {}", parts.join(" · ")), preferred))
-                }
-            });
-
-            let cve_suffix = audit
-                .as_ref()
-                .filter(|a| !a.advisories.is_empty())
-                .map(|a| {
-                    let (crit, high, mod_, low) = a.counts();
-                    let total = crit + high + mod_ + low;
-                    let badge = if crit > 0 {
-                        "🚨"
-                    } else if high > 0 {
-                        "‼"
-                    } else if mod_ > 0 {
-                        "⚠"
-                    } else {
-                        "ℹ"
-                    };
-                    let suffix = if total == 1 { "vuln" } else { "vulns" };
-                    format!(" {badge} {total} {suffix}")
-                });
-
-            let (text, kind, tooltip) = match (label, cve_suffix) {
-                (Some((t, k)), Some(s)) => (
-                    format!("{t}{s}"),
-                    k,
-                    audit_tooltip(&dep.name, audit.as_ref()),
-                ),
-                (Some((t, k)), None) => (t, k, format!("{} latest available", dep.name)),
-                (None, Some(s)) => (s, "audit", audit_tooltip(&dep.name, audit.as_ref())),
-                (None, None) => continue,
-            };
-            let pos = Position {
-                line: dep.value_range.end.line,
-                character: dep.value_range.end.character.saturating_add(1),
-            };
-            hints.push(InlayHint {
-                position: pos,
-                label: InlayHintLabel::String(text),
-                kind: Some(InlayHintKind::TYPE),
-                text_edits: None,
-                tooltip: Some(InlayHintTooltip::String(tooltip)),
-                padding_left: Some(true),
-                padding_right: None,
-                data: None,
-            });
-            let _ = kind;
         }
         hints
     }
 
-    fn upgrade_actions(
-        &self,
-        uri: &Url,
-        dep: &DepEntry,
-        versions: &[Version],
-        latest: &Version,
-    ) -> Vec<CodeActionOrCommand> {
-        let (prefix, _) = split_prefix(&dep.range_str);
-        let Some(current) = current_pinned(&dep.range_str) else {
-            return Vec::new();
-        };
-        let mut emitted: Vec<String> = Vec::new();
-        let mut actions = Vec::new();
-        let preferred_kind = upgrade_kind(Some(&current), latest);
-
-        for kind in ["patch", "minor", "major"] {
-            let Some(target) = pick_tier_target(versions, &current, kind) else {
-                continue;
-            };
-            if target <= current {
-                continue;
-            }
-            let target_str = target.to_string();
-            if emitted.contains(&target_str) {
-                continue;
-            }
-            emitted.push(target_str.clone());
-            let title = match kind {
-                "patch" => format!("Patch update to {target_str}"),
-                "minor" => format!("Minor update to {target_str}"),
-                "major" => format!("Major update to {target_str}"),
-                _ => format!("Update to {target_str}"),
-            };
-            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                title,
-                kind: Some(CodeActionKind::QUICKFIX),
-                edit: Some(workspace_edit(
-                    uri,
-                    dep.value_range,
-                    format!("{prefix}{target_str}"),
-                )),
-                is_preferred: Some(kind == preferred_kind),
-                ..Default::default()
-            }));
+    async fn dep_inlay_hint(&self, dep: &DepEntry, settings: &Settings) -> Option<InlayHint> {
+        if is_ignored(&dep.name, settings) || dep.range.is_none() {
+            return None;
         }
-        actions
+        let (pkg, audit) = self.fetch_dep(dep, settings.audit).await?;
+        let current = current_pinned(&dep.range_str);
+
+        let upgrade_label = current
+            .as_ref()
+            .and_then(|c| upgrade_label(dep, &pkg, c, settings));
+        let cve_suffix = audit.as_ref().and_then(advisory_badge);
+
+        let body = match (upgrade_label, cve_suffix) {
+            (Some(u), Some(c)) => format!("{u}{c}"),
+            (Some(u), None) => u,
+            (None, Some(c)) => c,
+            (None, None) => return None,
+        };
+
+        Some(InlayHint {
+            position: hint_anchor(dep.value_range.end),
+            label: InlayHintLabel::String(body),
+            kind: Some(InlayHintKind::TYPE),
+            text_edits: None,
+            tooltip: Some(InlayHintTooltip::String(audit_tooltip(
+                &dep.name,
+                audit.as_ref(),
+            ))),
+            padding_left: Some(true),
+            padding_right: None,
+            data: None,
+        })
     }
 
     async fn completions_for(&self, uri: &Url, pos: Position) -> Option<CompletionResponse> {
-        let doc = self.docs.get(uri).map(|d| d.clone())?;
-        let dep = doc
-            .deps
-            .iter()
-            .find(|d| position_in_range(pos, d.value_range))?
-            .clone();
+        let dep = self.dep_at(uri, pos)?;
         let pkg = self.registry.fetch(&dep.name).await?;
         if pkg.status != PackageStatus::Found {
             return None;
@@ -316,108 +193,159 @@ impl Backend {
 
         let (prefix, typed) = split_prefix(&dep.range_str);
         let latest = pkg.latest.as_ref().map(ToString::to_string);
-        let mut items = Vec::with_capacity(COMPLETION_LIMIT);
-        for (idx, version) in pkg
+        let items: Vec<CompletionItem> = pkg
             .versions
             .iter()
-            .filter(|v| str_starts_with(&v.to_string(), typed))
+            .filter(|v| has_prefix(&v.to_string(), typed))
             .take(COMPLETION_LIMIT)
             .enumerate()
-        {
-            let v_str = version.to_string();
-            let is_latest = latest.as_deref() == Some(v_str.as_str());
-            items.push(CompletionItem {
-                label: v_str.clone(),
-                label_details: Some(CompletionItemLabelDetails {
-                    detail: None,
-                    description: if is_latest { Some("latest".into()) } else { None },
-                }),
-                kind: Some(CompletionItemKind::VALUE),
-                sort_text: Some(format!("{:04}", idx)),
-                filter_text: Some(v_str.clone()),
-                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                    range: dep.value_range,
-                    new_text: format!("{prefix}{v_str}"),
-                })),
-                ..Default::default()
-            });
-        }
+            .map(|(idx, v)| {
+                let v_str = v.to_string();
+                let is_latest = latest.as_deref() == Some(v_str.as_str());
+                CompletionItem {
+                    label: v_str.clone(),
+                    label_details: Some(CompletionItemLabelDetails {
+                        detail: None,
+                        description: is_latest.then(|| "latest".into()),
+                    }),
+                    kind: Some(CompletionItemKind::VALUE),
+                    sort_text: Some(format!("{idx:04}")),
+                    filter_text: Some(v_str.clone()),
+                    text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                        range: dep.value_range,
+                        new_text: format!("{prefix}{v_str}"),
+                    })),
+                    ..Default::default()
+                }
+            })
+            .collect();
         Some(CompletionResponse::Array(items))
     }
 
     async fn hover_for(&self, uri: &Url, pos: Position) -> Option<Hover> {
-        let doc = self.docs.get(uri).map(|d| d.clone())?;
-        let dep = doc
-            .deps
-            .iter()
-            .find(|d| position_in_range(pos, d.value_range))?
-            .clone();
+        let dep = self.dep_at(uri, pos)?;
+        let settings = self.settings.read().await.clone();
+        let (pkg, audit) = self.fetch_dep(&dep, settings.audit).await?;
+        Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: hover_markdown(&dep, &pkg, audit.as_ref()),
+            }),
+            range: Some(dep.value_range),
+        })
+    }
+
+    async fn code_actions_for(&self, uri: &Url, cursor: Position) -> Vec<CodeActionOrCommand> {
+        let mut out = bulk_update_actions(uri);
+        let Some(doc) = self.docs.get(uri).map(|d| d.clone()) else {
+            return out;
+        };
+        let settings = self.settings.read().await.clone();
+        for dep in doc.deps.iter().filter(|d| position_in_range(cursor, d.value_range)) {
+            out.extend(self.dep_actions(uri, dep, &settings).await);
+        }
+        out
+    }
+
+    async fn dep_actions(
+        &self,
+        uri: &Url,
+        dep: &DepEntry,
+        settings: &Settings,
+    ) -> Vec<CodeActionOrCommand> {
+        let Some((pkg, audit)) = self.fetch_dep(dep, settings.audit).await else {
+            return Vec::new();
+        };
+        let Some(latest) = pkg.latest.as_ref() else {
+            return Vec::new();
+        };
+
+        let mut actions = upgrade_actions_for(uri, dep, &pkg.versions, latest);
+        if let Some(audit) = audit.as_ref() {
+            if let Some(action) = safe_upgrade_action(uri, dep, audit) {
+                actions.push(action);
+            }
+        }
+        if let Some(home) = pkg.homepage.as_deref() {
+            actions.push(open_url_action("Open homepage", home.into()));
+        }
+        if let Some(changelog) = pkg.repository_url.as_deref().and_then(changelog_url) {
+            actions.push(open_url_action("Open changelog", changelog));
+        }
+        actions
+    }
+
+    async fn run_update_all(&self, uri: Url, tier: &str) {
+        let Some(doc) = self.docs.get(&uri).map(|d| d.clone()) else {
+            return;
+        };
+        let settings = self.settings.read().await.clone();
+        let mut edits = Vec::new();
+        for dep in &doc.deps {
+            if let Some(edit) = self.tier_edit(dep, tier, &settings).await {
+                edits.push(edit);
+            }
+        }
+        if edits.is_empty() {
+            return;
+        }
+        let mut changes = HashMap::new();
+        changes.insert(uri, edits);
+        let _ = self
+            .client
+            .apply_edit(WorkspaceEdit {
+                changes: Some(changes),
+                document_changes: None,
+                change_annotations: None,
+            })
+            .await;
+    }
+
+    async fn tier_edit(
+        &self,
+        dep: &DepEntry,
+        tier: &str,
+        settings: &Settings,
+    ) -> Option<TextEdit> {
+        if is_ignored(&dep.name, settings) || dep.range.is_none() {
+            return None;
+        }
         let pkg = self.registry.fetch(&dep.name).await?;
         if pkg.status != PackageStatus::Found {
             return None;
         }
-        let mut md = format!("**{}**", dep.name);
-        if let Some(latest) = &pkg.latest {
-            md.push_str(&format!("  ·  latest `{latest}`"));
+        let current = current_pinned(&dep.range_str)?;
+        let target = pick_tier_target(&pkg.versions, &current, tier)?;
+        if target <= current || version_ignored(&dep.name, &target, settings) {
+            return None;
         }
-        if let Some(license) = &pkg.license {
-            md.push_str(&format!("  ·  {license}"));
-        }
-        md.push_str("\n\n");
-        if let Some(desc) = &pkg.description {
-            md.push_str(desc);
-            md.push_str("\n\n");
-        }
-        if let Some(home) = &pkg.homepage {
-            md.push_str(&format!("[homepage]({home})"));
-        }
-        if let Some(repo) = pkg.repository_url.as_deref().and_then(changelog_url) {
-            md.push_str(&format!("  ·  [changelog]({repo})"));
-        }
-
-        let settings = self.settings.read().await.clone();
-        if settings.audit {
-            if let Some(current) = current_pinned(&dep.range_str) {
-                if let Some(audit) = self.auditor.audit(&dep.name, &current).await {
-                    if !audit.advisories.is_empty() {
-                        md.push_str(&format!(
-                            "\n\n---\n\n**Security advisories** ({} for `{current}`)\n",
-                            audit.advisories.len()
-                        ));
-                        for adv in &audit.advisories {
-                            let badge = match adv.severity {
-                                AdvisorySeverity::Critical => "🔴 critical",
-                                AdvisorySeverity::High => "🔴 high",
-                                AdvisorySeverity::Moderate => "🟡 moderate",
-                                AdvisorySeverity::Low => "🟢 low",
-                                AdvisorySeverity::Unknown => "⚪ unknown",
-                            };
-                            let title = match &adv.url {
-                                Some(u) => format!("[{}]({u})", adv.id),
-                                None => adv.id.clone(),
-                            };
-                            let fix = adv
-                                .fixed_in
-                                .as_ref()
-                                .map(|f| format!(" — fixed in `{f}`"))
-                                .unwrap_or_default();
-                            md.push_str(&format!(
-                                "\n- {badge} · {title} — {}{fix}",
-                                adv.summary
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-
-        Some(Hover {
-            contents: HoverContents::Markup(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: md,
-            }),
-            range: Some(dep.value_range),
+        let (prefix, _) = split_prefix(&dep.range_str);
+        Some(TextEdit {
+            range: dep.value_range,
+            new_text: format!("{prefix}{target}"),
         })
+    }
+
+    async fn open_external(&self, url: &str) {
+        let Ok(parsed) = Url::parse(url) else { return };
+        let _ = self
+            .client
+            .show_document(ShowDocumentParams {
+                uri: parsed,
+                external: Some(true),
+                take_focus: Some(true),
+                selection: None,
+            })
+            .await;
+    }
+
+    fn dep_at(&self, uri: &Url, pos: Position) -> Option<DepEntry> {
+        self.docs
+            .get(uri)
+            .map(|d| d.clone())?
+            .deps
+            .into_iter()
+            .find(|d| position_in_range(pos, d.value_range))
     }
 }
 
@@ -475,10 +403,11 @@ impl LanguageServer for Backend {
             .ok()
             .and_then(|mut v| v.pop())
             .unwrap_or(Value::Null);
-        if !cfg.is_null() {
-            if let Ok(parsed) = serde_json::from_value::<Settings>(cfg) {
-                *self.settings.write().await = parsed;
-            }
+        if cfg.is_null() {
+            return;
+        }
+        if let Ok(parsed) = serde_json::from_value::<Settings>(cfg) {
+            *self.settings.write().await = parsed;
         }
     }
 
@@ -487,7 +416,7 @@ impl LanguageServer for Backend {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        let uri = params.text_document.uri.clone();
+        let uri = params.text_document.uri;
         if !is_package_json(&uri) {
             return;
         }
@@ -495,13 +424,14 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        let uri = params.text_document.uri.clone();
+        let uri = params.text_document.uri;
         if !is_package_json(&uri) {
             return;
         }
-        if let Some(change) = params.content_changes.into_iter().last() {
-            self.ingest(uri, &change.text).await;
-        }
+        let Some(change) = params.content_changes.into_iter().last() else {
+            return;
+        };
+        self.ingest(uri, &change.text).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -511,12 +441,13 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
-        if let Ok(parsed) = serde_json::from_value::<Settings>(params.settings) {
-            *self.settings.write().await = parsed;
-            let uris: Vec<Url> = self.docs.iter().map(|e| e.key().clone()).collect();
-            for uri in uris {
-                self.refresh(uri).await;
-            }
+        let Ok(parsed) = serde_json::from_value::<Settings>(params.settings) else {
+            return;
+        };
+        *self.settings.write().await = parsed;
+        let uris: Vec<Url> = self.docs.iter().map(|e| e.key().clone()).collect();
+        for uri in uris {
+            self.refresh(uri).await;
         }
     }
 
@@ -552,70 +483,315 @@ impl LanguageServer for Backend {
         &self,
         params: CodeActionParams,
     ) -> LspResult<Option<CodeActionResponse>> {
-        let uri = params.text_document.uri.clone();
+        let uri = params.text_document.uri;
         if !is_package_json(&uri) {
             return Ok(None);
         }
-        let Some(doc) = self.docs.get(&uri).map(|d| d.clone()) else {
-            return Ok(None);
-        };
-        let cursor = params.range.start;
-        let mut actions: Vec<CodeActionOrCommand> = Vec::new();
+        Ok(Some(
+            self.code_actions_for(&uri, params.range.start).await,
+        ))
+    }
 
-        for dep in doc.deps.iter() {
-            if !position_in_range(cursor, dep.value_range) {
-                continue;
-            }
-            let Some(pkg) = self.registry.fetch(&dep.name).await else {
-                continue;
-            };
-            if pkg.status != PackageStatus::Found {
-                continue;
-            }
-            let Some(latest) = pkg.latest.clone() else {
-                continue;
-            };
-            actions.extend(self.upgrade_actions(&uri, dep, &pkg.versions, &latest));
-
-            let settings = self.settings.read().await.clone();
-            if settings.audit {
-                if let Some(current) = current_pinned(&dep.range_str) {
-                    if let Some(audit) = self.auditor.audit(&dep.name, &current).await {
-                        if let Some(target) = audit.safe_target() {
-                            if target > current {
-                                let (prefix, _) = split_prefix(&dep.range_str);
-                                let title = format!("Update to first non-vulnerable version ({target})");
-                                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                                    title,
-                                    kind: Some(CodeActionKind::QUICKFIX),
-                                    edit: Some(workspace_edit(
-                                        &uri,
-                                        dep.value_range,
-                                        format!("{prefix}{target}"),
-                                    )),
-                                    is_preferred: Some(true),
-                                    ..Default::default()
-                                }));
-                            }
-                        }
-                    }
+    async fn execute_command(&self, params: ExecuteCommandParams) -> LspResult<Option<Value>> {
+        let mut args = params.arguments.into_iter();
+        match params.command.as_str() {
+            CMD_OPEN_URL => {
+                if let Some(Value::String(url)) = args.next() {
+                    self.open_external(&url).await;
                 }
+                Ok(None)
             }
-            if let Some(home) = pkg.homepage.clone() {
-                actions.push(open_url_action("Open homepage", home));
+            CMD_UPDATE_ALL => {
+                let Some(Value::String(uri_s)) = args.next() else {
+                    return Ok(None);
+                };
+                let tier = match args.next() {
+                    Some(Value::String(s)) => s,
+                    _ => "major".into(),
+                };
+                let Ok(uri) = Url::parse(&uri_s) else {
+                    return Ok(None);
+                };
+                self.run_update_all(uri, &tier).await;
+                Ok(None)
             }
-            if let Some(repo) = pkg.repository_url.as_deref().and_then(changelog_url) {
-                actions.push(open_url_action("Open changelog", repo));
-            }
+            _ => Ok(None),
         }
+    }
+}
 
-        for tier in ["patch", "minor", "major"] {
-            let title = match tier {
+// ─── Pure helpers ──────────────────────────────────────────────────────────
+
+fn invalid_semver_diagnostic(dep: &DepEntry) -> Diagnostic {
+    Diagnostic {
+        range: dep.value_range,
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: Some(NumberOrString::String("invalid-semver".into())),
+        source: Some("package-json-upgrade".into()),
+        message: format!("Invalid semver range: \"{}\"", dep.range_str),
+        ..Default::default()
+    }
+}
+
+fn not_found_diagnostic(dep: &DepEntry) -> Diagnostic {
+    Diagnostic {
+        range: dep.value_range,
+        severity: Some(DiagnosticSeverity::WARNING),
+        code: Some(NumberOrString::String("not-found".into())),
+        source: Some("package-json-upgrade".into()),
+        message: format!("Package \"{}\" not found in npm registry", dep.name),
+        ..Default::default()
+    }
+}
+
+fn advisory_diagnostic(dep: &DepEntry, adv: &Advisory) -> Diagnostic {
+    let severity = match adv.severity {
+        AdvisorySeverity::Critical | AdvisorySeverity::High => DiagnosticSeverity::ERROR,
+        AdvisorySeverity::Moderate => DiagnosticSeverity::WARNING,
+        _ => DiagnosticSeverity::INFORMATION,
+    };
+    let mut message = format!("[{}] {}", adv.id, adv.summary);
+    if let Some(fix) = &adv.fixed_in {
+        message.push_str(&format!(" — fixed in {fix}"));
+    }
+    Diagnostic {
+        range: dep.value_range,
+        severity: Some(severity),
+        code: Some(NumberOrString::String(adv.id.clone())),
+        code_description: adv
+            .url
+            .as_deref()
+            .and_then(|u| Url::parse(u).ok())
+            .map(|href| CodeDescription { href }),
+        source: Some("package-json-upgrade/audit".into()),
+        message,
+        ..Default::default()
+    }
+}
+
+fn upgrade_label(
+    dep: &DepEntry,
+    pkg: &CachedPackage,
+    current: &Version,
+    settings: &Settings,
+) -> Option<String> {
+    let mut emitted = Vec::new();
+    let mut parts = Vec::new();
+    for (tier, marker) in [("patch", "🟢"), ("minor", "🟡"), ("major", "🔴")] {
+        let Some(target) = pick_tier_target(&pkg.versions, current, tier) else {
+            continue;
+        };
+        if &target <= current || version_ignored(&dep.name, &target, settings) {
+            continue;
+        }
+        let target_str = target.to_string();
+        if emitted.contains(&target_str) {
+            continue;
+        }
+        emitted.push(target_str.clone());
+        parts.push(format!("{marker} {target_str}"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!(" {}", parts.join(" · ")))
+    }
+}
+
+fn advisory_badge(audit: &AuditResult) -> Option<String> {
+    if audit.advisories.is_empty() {
+        return None;
+    }
+    let (crit, high, mod_, low) = audit.counts();
+    let total = crit + high + mod_ + low;
+    let badge = if crit > 0 {
+        "🚨"
+    } else if high > 0 {
+        "‼"
+    } else if mod_ > 0 {
+        "⚠"
+    } else {
+        "ℹ"
+    };
+    let suffix = if total == 1 { "vuln" } else { "vulns" };
+    Some(format!(" {badge} {total} {suffix}"))
+}
+
+fn audit_tooltip(name: &str, audit: Option<&AuditResult>) -> String {
+    let Some(audit) = audit else {
+        return name.to_string();
+    };
+    if audit.advisories.is_empty() {
+        return name.to_string();
+    }
+    let suffix = if audit.advisories.len() == 1 { "y" } else { "ies" };
+    let mut s = format!("{name} — {} advisor{suffix}", audit.advisories.len());
+    for adv in audit.advisories.iter().take(5) {
+        s.push_str(&format!("\n• [{}] {}", adv.id, adv.summary));
+    }
+    if audit.advisories.len() > 5 {
+        s.push_str(&format!("\n… +{} more", audit.advisories.len() - 5));
+    }
+    s
+}
+
+fn hint_anchor(end: Position) -> Position {
+    Position {
+        line: end.line,
+        character: end.character.saturating_add(1),
+    }
+}
+
+fn hover_markdown(dep: &DepEntry, pkg: &CachedPackage, audit: Option<&AuditResult>) -> String {
+    let mut md = format!("**{}**", dep.name);
+    if let Some(latest) = &pkg.latest {
+        md.push_str(&format!("  ·  latest `{latest}`"));
+    }
+    if let Some(license) = &pkg.license {
+        md.push_str(&format!("  ·  {license}"));
+    }
+    md.push_str("\n\n");
+    if let Some(desc) = &pkg.description {
+        md.push_str(desc);
+        md.push_str("\n\n");
+    }
+    if let Some(home) = &pkg.homepage {
+        md.push_str(&format!("[homepage]({home})"));
+    }
+    if let Some(repo) = pkg.repository_url.as_deref().and_then(changelog_url) {
+        md.push_str(&format!("  ·  [changelog]({repo})"));
+    }
+
+    let Some(audit) = audit else { return md };
+    if audit.advisories.is_empty() {
+        return md;
+    }
+    let current = current_pinned(&dep.range_str);
+    let header = match current {
+        Some(c) => format!(
+            "\n\n---\n\n**Security advisories** ({} for `{c}`)\n",
+            audit.advisories.len()
+        ),
+        None => format!(
+            "\n\n---\n\n**Security advisories** ({})\n",
+            audit.advisories.len()
+        ),
+    };
+    md.push_str(&header);
+    for adv in &audit.advisories {
+        md.push_str(&format!("\n- {}", advisory_line(adv)));
+    }
+    md
+}
+
+fn advisory_line(adv: &Advisory) -> String {
+    let badge = match adv.severity {
+        AdvisorySeverity::Critical => "🔴 critical",
+        AdvisorySeverity::High => "🔴 high",
+        AdvisorySeverity::Moderate => "🟡 moderate",
+        AdvisorySeverity::Low => "🟢 low",
+        AdvisorySeverity::Unknown => "⚪ unknown",
+    };
+    let title = match &adv.url {
+        Some(u) => format!("[{}]({u})", adv.id),
+        None => adv.id.clone(),
+    };
+    let fix = adv
+        .fixed_in
+        .as_ref()
+        .map(|f| format!(" — fixed in `{f}`"))
+        .unwrap_or_default();
+    format!("{badge} · {title} — {}{fix}", adv.summary)
+}
+
+fn upgrade_actions_for(
+    uri: &Url,
+    dep: &DepEntry,
+    versions: &[Version],
+    latest: &Version,
+) -> Vec<CodeActionOrCommand> {
+    let Some(current) = current_pinned(&dep.range_str) else {
+        return Vec::new();
+    };
+    let preferred = upgrade_kind(Some(&current), latest);
+    let (prefix, _) = split_prefix(&dep.range_str);
+
+    let mut emitted = Vec::new();
+    let mut actions = Vec::new();
+    for tier in TIERS {
+        let Some(target) = pick_tier_target(versions, &current, tier) else {
+            continue;
+        };
+        if target <= current {
+            continue;
+        }
+        let target_str = target.to_string();
+        if emitted.contains(&target_str) {
+            continue;
+        }
+        emitted.push(target_str.clone());
+        actions.push(upgrade_action(uri, dep, prefix, tier, &target_str, tier == preferred));
+    }
+    actions
+}
+
+fn upgrade_action(
+    uri: &Url,
+    dep: &DepEntry,
+    prefix: &str,
+    tier: &str,
+    target: &str,
+    preferred: bool,
+) -> CodeActionOrCommand {
+    let title = match tier {
+        "patch" => format!("Patch update to {target}"),
+        "minor" => format!("Minor update to {target}"),
+        "major" => format!("Major update to {target}"),
+        _ => format!("Update to {target}"),
+    };
+    CodeActionOrCommand::CodeAction(CodeAction {
+        title,
+        kind: Some(CodeActionKind::QUICKFIX),
+        edit: Some(workspace_edit(uri, dep.value_range, format!("{prefix}{target}"))),
+        is_preferred: Some(preferred),
+        ..Default::default()
+    })
+}
+
+fn safe_upgrade_action(
+    uri: &Url,
+    dep: &DepEntry,
+    audit: &AuditResult,
+) -> Option<CodeActionOrCommand> {
+    let current = current_pinned(&dep.range_str)?;
+    let target = audit.safe_target()?;
+    if target <= current {
+        return None;
+    }
+    let (prefix, _) = split_prefix(&dep.range_str);
+    Some(CodeActionOrCommand::CodeAction(CodeAction {
+        title: format!("Update to first non-vulnerable version ({target})"),
+        kind: Some(CodeActionKind::QUICKFIX),
+        edit: Some(workspace_edit(
+            uri,
+            dep.value_range,
+            format!("{prefix}{target}"),
+        )),
+        is_preferred: Some(true),
+        ..Default::default()
+    }))
+}
+
+fn bulk_update_actions(uri: &Url) -> Vec<CodeActionOrCommand> {
+    TIERS
+        .iter()
+        .map(|tier| {
+            let title = match *tier {
                 "patch" => "Update all dependencies (patch)",
                 "minor" => "Update all dependencies (minor)",
                 _ => "Update all dependencies (major)",
             };
-            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+            CodeActionOrCommand::CodeAction(CodeAction {
                 title: title.into(),
                 kind: Some(CodeActionKind::new("source.package-json-upgrade.updateAll")),
                 command: Some(Command {
@@ -623,99 +799,13 @@ impl LanguageServer for Backend {
                     command: CMD_UPDATE_ALL.into(),
                     arguments: Some(vec![
                         Value::String(uri.to_string()),
-                        Value::String(tier.into()),
+                        Value::String((*tier).into()),
                     ]),
                 }),
                 ..Default::default()
-            }));
-        }
-
-        Ok(Some(actions))
-    }
-
-    async fn execute_command(&self, params: ExecuteCommandParams) -> LspResult<Option<Value>> {
-        match params.command.as_str() {
-            CMD_OPEN_URL => {
-                if let Some(Value::String(url)) = params.arguments.into_iter().next() {
-                    if let Ok(parsed) = Url::parse(&url) {
-                        let _ = self
-                            .client
-                            .show_document(ShowDocumentParams {
-                                uri: parsed,
-                                external: Some(true),
-                                take_focus: Some(true),
-                                selection: None,
-                            })
-                            .await;
-                    }
-                }
-                Ok(None)
-            }
-            CMD_UPDATE_ALL => {
-                let mut args = params.arguments.into_iter();
-                let Some(Value::String(uri_s)) = args.next() else {
-                    return Ok(None);
-                };
-                let tier = match args.next() {
-                    Some(Value::String(s)) => s,
-                    _ => "major".to_string(),
-                };
-                let Ok(uri) = Url::parse(&uri_s) else {
-                    return Ok(None);
-                };
-                let Some(doc) = self.docs.get(&uri).map(|d| d.clone()) else {
-                    return Ok(None);
-                };
-                let settings = self.settings.read().await.clone();
-                let mut edits = Vec::new();
-                for dep in &doc.deps {
-                    if is_ignored(&dep.name, &settings) {
-                        continue;
-                    }
-                    if dep.range.is_none() {
-                        continue;
-                    }
-                    let Some(pkg) = self.registry.fetch(&dep.name).await else {
-                        continue;
-                    };
-                    if pkg.status != PackageStatus::Found {
-                        continue;
-                    }
-                    let Some(current) = current_pinned(&dep.range_str) else {
-                        continue;
-                    };
-                    let Some(target) = pick_tier_target(&pkg.versions, &current, &tier) else {
-                        continue;
-                    };
-                    if target <= current {
-                        continue;
-                    }
-                    if version_ignored(&dep.name, &target, &settings) {
-                        continue;
-                    }
-                    let (prefix, _) = split_prefix(&dep.range_str);
-                    edits.push(TextEdit {
-                        range: dep.value_range,
-                        new_text: format!("{prefix}{target}"),
-                    });
-                }
-                if !edits.is_empty() {
-                    let mut changes = HashMap::new();
-                    changes.insert(uri.clone(), edits);
-                    let _ = self
-                        .client
-                        .apply_edit(WorkspaceEdit {
-                            changes: Some(changes),
-                            document_changes: None,
-                            change_annotations: None,
-                        })
-                        .await;
-                }
-                Ok(None)
-            }
-            _ => Ok(None),
-        }
-    }
+            })
+        })
+        .collect()
 }
 
 fn open_url_action(title: &str, url: String) -> CodeActionOrCommand {
@@ -745,60 +835,24 @@ fn is_package_json(uri: &Url) -> bool {
     uri.path()
         .rsplit('/')
         .next()
-        .map(|f| f == "package.json")
-        .unwrap_or(false)
+        .is_some_and(|f| f == "package.json")
 }
 
 fn is_ignored(name: &str, settings: &Settings) -> bool {
-    settings.ignore_patterns.iter().any(|pat| {
-        Regex::new(pat)
-            .map(|re| re.is_match(name))
-            .unwrap_or(false)
-    })
+    settings
+        .ignore_patterns
+        .iter()
+        .any(|pat| Regex::new(pat).is_ok_and(|re| re.is_match(name)))
 }
 
 fn version_ignored(name: &str, version: &Version, settings: &Settings) -> bool {
-    let Some(rule) = settings.ignore_versions.get(name) else {
-        return false;
-    };
-    rule.parse::<nodejs_semver::Range>()
-        .map(|r| r.satisfies(version))
-        .unwrap_or(false)
+    settings
+        .ignore_versions
+        .get(name)
+        .and_then(|rule| rule.parse::<nodejs_semver::Range>().ok())
+        .is_some_and(|r| r.satisfies(version))
 }
 
-fn str_starts_with(haystack: &str, needle: &str) -> bool {
+fn has_prefix(haystack: &str, needle: &str) -> bool {
     needle.is_empty() || haystack.starts_with(needle)
 }
-
-fn audit_tooltip(name: &str, audit: Option<&AuditResult>) -> String {
-    let Some(audit) = audit else {
-        return name.to_string();
-    };
-    if audit.advisories.is_empty() {
-        return name.to_string();
-    }
-    let mut s = format!("{name} — {} advisor", audit.advisories.len());
-    s.push_str(if audit.advisories.len() == 1 { "y" } else { "ies" });
-    for adv in audit.advisories.iter().take(5) {
-        s.push_str(&format!("\n• [{}] {}", adv.id, adv.summary));
-    }
-    if audit.advisories.len() > 5 {
-        s.push_str(&format!("\n… +{} more", audit.advisories.len() - 5));
-    }
-    s
-}
-
-fn pick_tier_target(versions: &[Version], current: &Version, tier: &str) -> Option<Version> {
-    let mut stable = versions.iter().filter(|v| !v.is_prerelease());
-    match tier {
-        "patch" => stable
-            .find(|v| v.major == current.major && v.minor == current.minor && *v > current)
-            .cloned(),
-        "minor" => stable
-            .find(|v| v.major == current.major && *v > current)
-            .cloned(),
-        "major" => stable.next().cloned(),
-        _ => None,
-    }
-}
-
