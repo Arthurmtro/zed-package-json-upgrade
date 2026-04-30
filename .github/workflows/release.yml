@@ -29,9 +29,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.7.7
         with:
           workspaces: lsp
+          cache-on-failure: true
 
       - name: Build
         working-directory: lsp

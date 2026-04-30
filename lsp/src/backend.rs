@@ -166,24 +166,69 @@ impl Backend {
         hints
     }
 
-    fn upgrade_action(&self, uri: &Url, dep: &DepEntry, latest: &Version) -> CodeActionOrCommand {
-        let current = current_pinned(&dep.range_str);
+    fn upgrade_actions(
+        &self,
+        uri: &Url,
+        dep: &DepEntry,
+        versions: &[Version],
+        latest: &Version,
+    ) -> Vec<CodeActionOrCommand> {
         let (prefix, _) = split_prefix(&dep.range_str);
-        let kind = upgrade_kind(current.as_ref(), latest);
-        let title = match kind {
-            "major" => format!("Do major upgrade to {latest}"),
-            "minor" => format!("Do minor upgrade to {latest}"),
-            "patch" => format!("Do patch upgrade to {latest}"),
-            _ => format!("Upgrade to {latest}"),
+        let current = current_pinned(&dep.range_str);
+
+        let stable: Vec<&Version> = versions.iter().filter(|v| !v.is_prerelease()).collect();
+
+        let pick = |kind: &str| -> Option<&Version> {
+            let cur = current.as_ref()?;
+            match kind {
+                "patch" => stable
+                    .iter()
+                    .find(|v| v.major == cur.major && v.minor == cur.minor && **v > cur)
+                    .copied(),
+                "minor" => stable
+                    .iter()
+                    .find(|v| v.major == cur.major && **v > cur)
+                    .copied(),
+                "major" => stable.first().copied(),
+                _ => None,
+            }
         };
-        let new_value = format!("{prefix}{latest}");
-        CodeActionOrCommand::CodeAction(CodeAction {
-            title,
-            kind: Some(CodeActionKind::QUICKFIX),
-            edit: Some(workspace_edit(uri, dep.value_range, new_value)),
-            is_preferred: Some(true),
-            ..Default::default()
-        })
+
+        let mut emitted: Vec<String> = Vec::new();
+        let mut actions = Vec::new();
+        let preferred_kind = upgrade_kind(current.as_ref(), latest);
+
+        for kind in ["patch", "minor", "major"] {
+            let Some(target) = pick(kind) else { continue };
+            if let Some(cur) = current.as_ref() {
+                if target <= cur {
+                    continue;
+                }
+            }
+            let target_str = target.to_string();
+            if emitted.contains(&target_str) {
+                continue;
+            }
+            emitted.push(target_str.clone());
+            let title = match kind {
+                "patch" => format!("Patch update to {target_str}"),
+                "minor" => format!("Minor update to {target_str}"),
+                "major" => format!("Major update to {target_str}"),
+                _ => format!("Update to {target_str}"),
+            };
+            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title,
+                kind: Some(CodeActionKind::QUICKFIX),
+                edit: Some(workspace_edit(
+                    uri,
+                    dep.value_range,
+                    format!("{prefix}{target_str}"),
+                )),
+                is_preferred: Some(kind == preferred_kind),
+                ..Default::default()
+            }));
+        }
+        actions
     }
 
     async fn completions_for(&self, uri: &Url, pos: Position) -> Option<CompletionResponse> {
@@ -422,7 +467,7 @@ impl LanguageServer for Backend {
             let Some(latest) = pkg.latest.clone() else {
                 continue;
             };
-            actions.push(self.upgrade_action(&uri, dep, &latest));
+            actions.extend(self.upgrade_actions(&uri, dep, &pkg.versions, &latest));
             if let Some(home) = pkg.homepage.clone() {
                 actions.push(open_url_action("Open homepage", home));
             }
