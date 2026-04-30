@@ -21,6 +21,12 @@ Features:
   - **Update all dependencies (patch / minor / major)** (document-wide quick-fix; pick the safety tier you want)
 - **Parallel registry prefetch** on open/change with a per-process concurrency cap (8 in-flight requests). Subsequent code actions, hovers, and completions are served from a 1-hour in-memory cache.
 
+<img width="496" height="151" alt="image" src="https://github.com/user-attachments/assets/1714e4b8-c122-4a0a-9159-02b1bd9a8a6e" />
+
+<img width="684" height="445" alt="image" src="https://github.com/user-attachments/assets/758d4fb5-2329-485e-9356-b5e006275dce" />
+
+<img width="260" height="165" alt="image" src="https://github.com/user-attachments/assets/9a870492-d4e9-4e85-9fc7-65e0dc701381" />
+
 ## Architecture
 
 | Piece | What it does |
