@@ -3,15 +3,21 @@
 Inline npm dependency update hints for `package.json` in [Zed](https://zed.dev).
 Inspired by the VS Code extension [`package-json-upgrade`](https://marketplace.visualstudio.com/items?itemName=codeandstuff.package-json-upgrade).
 
-For each outdated dependency:
+Features:
 
-- An inlay hint `→ <latest>` after the version string.
-- A `Hint`-severity diagnostic.
-- Quick-fix code actions (Zed default `cmd-.` / `ctrl-.`):
+- **Inlay hint** `→ <latest>` after each outdated dependency version.
+- **Diagnostics**:
+  - `Error` for invalid semver (`"react": "not-a-version"`).
+  - `Warning` for packages missing from the npm registry (typo, unpublished).
+  - `Hint` for outdated dependencies.
+- **Completions** inside the version string: typing `^`, `~`, `.`, or `"` lists the available versions for that package, with `latest` tagged.
+- **Hover** on a version string shows the package description, latest version, license, homepage, and changelog link.
+- **Quick-fix code actions** (Zed default `cmd-.` / `ctrl-.`):
   - **Do patch / minor / major upgrade to `<latest>`**
   - **Open homepage**
   - **Open changelog**
   - **Update all dependencies** (document-wide quick-fix)
+- **Parallel registry prefetch** on open/change with a per-process concurrency cap (8 in-flight requests). Subsequent code actions, hovers, and completions are served from a 1-hour in-memory cache.
 
 ## Architecture
 

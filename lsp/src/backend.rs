@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
 use dashmap::DashMap;
+use futures::future::join_all;
+use nodejs_semver::Version;
 use regex::Regex;
 use serde_json::Value;
 use tokio::sync::RwLock;
@@ -12,11 +14,12 @@ use crate::document::{
     current_pinned, parse_package_json, position_in_range, split_prefix, upgrade_kind, DepEntry,
     DocState,
 };
-use crate::registry::{changelog_url, Registry};
+use crate::registry::{changelog_url, PackageStatus, Registry};
 use crate::settings::Settings;
 
 const CMD_OPEN_URL: &str = "package-json-upgrade.openUrl";
 const CMD_UPDATE_ALL: &str = "package-json-upgrade.updateAll";
+const COMPLETION_LIMIT: usize = 60;
 
 pub struct Backend {
     client: Client,
@@ -33,6 +36,15 @@ impl Backend {
             registry: Registry::new(),
             settings: RwLock::new(Settings::default()),
         }
+    }
+
+    async fn ingest(&self, uri: Url, text: &str) {
+        let sections = self.settings.read().await.check_sections.clone();
+        let doc = parse_package_json(text, &sections);
+        let names: Vec<String> = doc.deps.iter().map(|d| d.name.clone()).collect();
+        self.docs.insert(uri.clone(), doc);
+        join_all(names.iter().map(|n| self.registry.fetch(n))).await;
+        self.refresh(uri).await;
     }
 
     async fn refresh(&self, uri: Url) {
@@ -53,11 +65,34 @@ impl Backend {
             if is_ignored(&dep.name, &settings) {
                 continue;
             }
+            if dep.range.is_none() {
+                out.push(Diagnostic {
+                    range: dep.value_range,
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    code: Some(NumberOrString::String("invalid-semver".into())),
+                    source: Some("package-json-upgrade".into()),
+                    message: format!("Invalid semver range: \"{}\"", dep.range_str),
+                    ..Default::default()
+                });
+                continue;
+            }
             let Some(pkg) = self.registry.fetch(&dep.name).await else {
                 continue;
             };
+            if pkg.status == PackageStatus::NotFound {
+                out.push(Diagnostic {
+                    range: dep.value_range,
+                    severity: Some(DiagnosticSeverity::WARNING),
+                    code: Some(NumberOrString::String("not-found".into())),
+                    source: Some("package-json-upgrade".into()),
+                    message: format!("Package \"{}\" not found in npm registry", dep.name),
+                    ..Default::default()
+                });
+                continue;
+            }
+            let range = dep.range.as_ref().expect("range checked above");
             let Some(latest) = &pkg.latest else { continue };
-            if dep.range.satisfies(latest) {
+            if range.satisfies(latest) {
                 continue;
             }
             if version_ignored(&dep.name, latest, &settings) {
@@ -88,17 +123,22 @@ impl Backend {
             if is_ignored(&dep.name, &settings) {
                 continue;
             }
+            let Some(range) = dep.range.as_ref() else {
+                continue;
+            };
             let Some(pkg) = self.registry.fetch(&dep.name).await else {
                 continue;
             };
+            if pkg.status != PackageStatus::Found {
+                continue;
+            }
             let Some(latest) = &pkg.latest else { continue };
-            if dep.range.satisfies(latest) {
+            if range.satisfies(latest) {
                 continue;
             }
             if version_ignored(&dep.name, latest, &settings) {
                 continue;
             }
-            // Place hint just past the closing quote of the version string.
             let pos = Position {
                 line: dep.value_range.end.line,
                 character: dep.value_range.end.character.saturating_add(1),
@@ -120,12 +160,7 @@ impl Backend {
         hints
     }
 
-    async fn upgrade_action(
-        &self,
-        uri: &Url,
-        dep: &DepEntry,
-        latest: &nodejs_semver::Version,
-    ) -> CodeActionOrCommand {
+    fn upgrade_action(&self, uri: &Url, dep: &DepEntry, latest: &Version) -> CodeActionOrCommand {
         let current = current_pinned(&dep.range_str);
         let (prefix, _) = split_prefix(&dep.range_str);
         let kind = upgrade_kind(current.as_ref(), latest);
@@ -144,6 +179,87 @@ impl Backend {
             ..Default::default()
         })
     }
+
+    async fn completions_for(&self, uri: &Url, pos: Position) -> Option<CompletionResponse> {
+        let doc = self.docs.get(uri).map(|d| d.clone())?;
+        let dep = doc
+            .deps
+            .iter()
+            .find(|d| position_in_range(pos, d.value_range))?
+            .clone();
+        let pkg = self.registry.fetch(&dep.name).await?;
+        if pkg.status != PackageStatus::Found {
+            return None;
+        }
+
+        let (prefix, typed) = split_prefix(&dep.range_str);
+        let latest = pkg.latest.as_ref().map(ToString::to_string);
+        let mut items = Vec::with_capacity(COMPLETION_LIMIT);
+        for (idx, version) in pkg
+            .versions
+            .iter()
+            .filter(|v| str_starts_with(&v.to_string(), typed))
+            .take(COMPLETION_LIMIT)
+            .enumerate()
+        {
+            let v_str = version.to_string();
+            let is_latest = latest.as_deref() == Some(v_str.as_str());
+            items.push(CompletionItem {
+                label: v_str.clone(),
+                label_details: Some(CompletionItemLabelDetails {
+                    detail: None,
+                    description: if is_latest { Some("latest".into()) } else { None },
+                }),
+                kind: Some(CompletionItemKind::VALUE),
+                sort_text: Some(format!("{:04}", idx)),
+                filter_text: Some(v_str.clone()),
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                    range: dep.value_range,
+                    new_text: format!("{prefix}{v_str}"),
+                })),
+                ..Default::default()
+            });
+        }
+        Some(CompletionResponse::Array(items))
+    }
+
+    async fn hover_for(&self, uri: &Url, pos: Position) -> Option<Hover> {
+        let doc = self.docs.get(uri).map(|d| d.clone())?;
+        let dep = doc
+            .deps
+            .iter()
+            .find(|d| position_in_range(pos, d.value_range))?
+            .clone();
+        let pkg = self.registry.fetch(&dep.name).await?;
+        if pkg.status != PackageStatus::Found {
+            return None;
+        }
+        let mut md = format!("**{}**", dep.name);
+        if let Some(latest) = &pkg.latest {
+            md.push_str(&format!("  ·  latest `{latest}`"));
+        }
+        if let Some(license) = &pkg.license {
+            md.push_str(&format!("  ·  {license}"));
+        }
+        md.push_str("\n\n");
+        if let Some(desc) = &pkg.description {
+            md.push_str(desc);
+            md.push_str("\n\n");
+        }
+        if let Some(home) = &pkg.homepage {
+            md.push_str(&format!("[homepage]({home})"));
+        }
+        if let Some(repo) = pkg.repository_url.as_deref().and_then(changelog_url) {
+            md.push_str(&format!("  ·  [changelog]({repo})"));
+        }
+        Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: md,
+            }),
+            range: Some(dep.value_range),
+        })
+    }
 }
 
 #[tower_lsp::async_trait]
@@ -158,6 +274,17 @@ impl LanguageServer for Backend {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec![
+                        "\"".into(),
+                        ".".into(),
+                        "^".into(),
+                        "~".into(),
+                    ]),
+                    resolve_provider: Some(false),
+                    ..Default::default()
+                }),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
                 code_action_provider: Some(CodeActionProviderCapability::Options(
                     CodeActionOptions {
                         code_action_kinds: Some(vec![
@@ -205,10 +332,7 @@ impl LanguageServer for Backend {
         if !is_package_json(&uri) {
             return;
         }
-        let sections = self.settings.read().await.check_sections.clone();
-        self.docs
-            .insert(uri.clone(), parse_package_json(&params.text_document.text, &sections));
-        self.refresh(uri).await;
+        self.ingest(uri, &params.text_document.text).await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -217,10 +341,7 @@ impl LanguageServer for Backend {
             return;
         }
         if let Some(change) = params.content_changes.into_iter().last() {
-            let sections = self.settings.read().await.check_sections.clone();
-            self.docs
-                .insert(uri.clone(), parse_package_json(&change.text, &sections));
-            self.refresh(uri).await;
+            self.ingest(uri, &change.text).await;
         }
     }
 
@@ -248,6 +369,26 @@ impl LanguageServer for Backend {
         Ok(Some(self.inlay_hints_for(&uri).await))
     }
 
+    async fn completion(&self, params: CompletionParams) -> LspResult<Option<CompletionResponse>> {
+        let uri = params.text_document_position.text_document.uri;
+        if !is_package_json(&uri) {
+            return Ok(None);
+        }
+        Ok(self
+            .completions_for(&uri, params.text_document_position.position)
+            .await)
+    }
+
+    async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        if !is_package_json(&uri) {
+            return Ok(None);
+        }
+        Ok(self
+            .hover_for(&uri, params.text_document_position_params.position)
+            .await)
+    }
+
     async fn code_action(
         &self,
         params: CodeActionParams,
@@ -269,10 +410,13 @@ impl LanguageServer for Backend {
             let Some(pkg) = self.registry.fetch(&dep.name).await else {
                 continue;
             };
+            if pkg.status != PackageStatus::Found {
+                continue;
+            }
             let Some(latest) = pkg.latest.clone() else {
                 continue;
             };
-            actions.push(self.upgrade_action(&uri, dep, &latest).await);
+            actions.push(self.upgrade_action(&uri, dep, &latest));
             if let Some(home) = pkg.homepage.clone() {
                 actions.push(open_url_action("Open homepage", home));
             }
@@ -329,11 +473,17 @@ impl LanguageServer for Backend {
                     if is_ignored(&dep.name, &settings) {
                         continue;
                     }
+                    let Some(range) = dep.range.as_ref() else {
+                        continue;
+                    };
                     let Some(pkg) = self.registry.fetch(&dep.name).await else {
                         continue;
                     };
+                    if pkg.status != PackageStatus::Found {
+                        continue;
+                    }
                     let Some(latest) = pkg.latest else { continue };
-                    if dep.range.satisfies(&latest) {
+                    if range.satisfies(&latest) {
                         continue;
                     }
                     if version_ignored(&dep.name, &latest, &settings) {
@@ -403,11 +553,7 @@ fn is_ignored(name: &str, settings: &Settings) -> bool {
     })
 }
 
-fn version_ignored(
-    name: &str,
-    version: &nodejs_semver::Version,
-    settings: &Settings,
-) -> bool {
+fn version_ignored(name: &str, version: &Version, settings: &Settings) -> bool {
     let Some(rule) = settings.ignore_versions.get(name) else {
         return false;
     };
@@ -415,3 +561,8 @@ fn version_ignored(
         .map(|r| r.satisfies(version))
         .unwrap_or(false)
 }
+
+fn str_starts_with(haystack: &str, needle: &str) -> bool {
+    needle.is_empty() || haystack.starts_with(needle)
+}
+

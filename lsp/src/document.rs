@@ -8,7 +8,7 @@ use tower_lsp::lsp_types::{Position, Range as LspRange};
 pub struct DepEntry {
     pub name: String,
     pub range_str: String,
-    pub range: Range,
+    pub range: Option<Range>,
     pub value_range: LspRange,
 }
 
@@ -40,9 +40,19 @@ pub fn parse_package_json(text: &str, sections: &[String]) -> DocState {
                 start: offset_to_position(text, abs_start),
                 end: offset_to_position(text, abs_end),
             };
-            let Ok(parsed_range) = range_str.parse::<Range>() else {
+            if range_str == "workspace:*" || range_str.starts_with("workspace:") {
                 continue;
-            };
+            }
+            if range_str.starts_with("file:")
+                || range_str.starts_with("link:")
+                || range_str.starts_with("git+")
+                || range_str.starts_with("github:")
+                || range_str.starts_with("npm:")
+                || range_str.contains("://")
+            {
+                continue;
+            }
+            let parsed_range = range_str.parse::<Range>().ok();
             deps.push(DepEntry {
                 name,
                 range_str,
