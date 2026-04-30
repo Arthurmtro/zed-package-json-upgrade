@@ -50,6 +50,30 @@ cargo build --release --manifest-path lsp/Cargo.toml
 #   "lsp": { "package-json-upgrade": { "binary": { "path": "/abs/path/to/target/release/package-json-upgrade-lsp" } } }
 ```
 
+## Enabling inlay hints (without enabling them everywhere)
+
+The colored markers (`🔴 25.6.0`, `⚠ 1h`, …) are LSP inlay hints. Zed defaults inlay hints to off because globally enabling them lights up every TypeScript / Rust / Python type hint too — which most people don't want. Enable them only for JSON in your `settings.json`:
+
+```jsonc
+{
+  // leave this off to keep TS/Rust/Python type hints out of the way
+  "inlay_hints": { "enabled": false },
+
+  "languages": {
+    "JSON": {
+      "inlay_hints": { "enabled": true }
+    },
+    "JSONC": {
+      "inlay_hints": { "enabled": true }
+    }
+  }
+}
+```
+
+This scopes inlay hints to JSON / JSONC buffers. Zed's built-in `json-language-server` does not emit inlay hints, so in practice the only extension this affects is `package-json-upgrade`.
+
+The diagnostics, hovers, and code actions work without any inlay-hint config — they're standard LSP features.
+
 ## Settings
 
 In Zed `settings.json`:
