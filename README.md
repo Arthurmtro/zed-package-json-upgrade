@@ -9,12 +9,10 @@ Features:
   - 🔴 major behind
   - 🟡 minor behind
   - 🟢 patch behind
-- **Diagnostics** are reserved for genuine problems:
+- **Diagnostics** for genuine problems only:
   - `Error` (red squiggle) — invalid semver in the version string.
   - `Warning` (yellow squiggle) — package not found in the npm registry.
-  - Outdated dependencies do *not* emit a diagnostic. The upgrade tier is communicated entirely by the colored inlay hint, so a file with many outdated deps stays free of squiggle noise.
-
-The "outdated" check compares the literal pinned version (the `X.Y.Z` written in the file, ignoring `^`/`~` etc.) against the registry's `dist-tags.latest`. This means `^19.0.0` still flags as outdated when latest is `19.5.0`, even though the caret range allows it — matching the VS Code package-json-upgrade behaviour.
+  - Outdated dependencies do not emit a diagnostic; the colored inlay hint already conveys the upgrade tier, and reserving squiggles for real errors keeps the file readable when many deps happen to be behind latest.
 - **Completions** inside the version string: typing `^`, `~`, `.`, or `"` lists the available versions for that package, with `latest` tagged.
 - **Hover** on a version string shows the package description, latest version, license, homepage, and changelog link.
 - **Quick-fix code actions** (Zed default `cmd-.` / `ctrl-.`):
@@ -39,16 +37,14 @@ The LSP attaches alongside Zed's built-in `json-language-server`. Both run, resu
 
 ## Install from source (dev)
 
+In Zed: `cmd-shift-p` → `zed: install dev extension` → pick this folder. Zed compiles the WASM and the extension downloads the matching LSP binary from the latest GitHub release on first use.
+
+To iterate on the LSP without round-tripping through a release, build and run it locally:
+
 ```sh
-# 1. Build the LSP locally
 cargo build --release --manifest-path lsp/Cargo.toml
-
-# 2. Make sure Zed can find it: place it on PATH or symlink it as
-#    ~/.local/bin/package-json-upgrade-lsp (the WASM downloader is bypassed
-#    when a binary of the same name already exists on PATH — see `src/lib.rs`).
-
-# 3. Install the extension as a dev extension:
-#    Zed → cmd-shift-p → "zed: install dev extension" → pick this folder.
+# point Zed at the local binary via ~/.config/zed/settings.json:
+#   "lsp": { "package-json-upgrade": { "binary": { "path": "/abs/path/to/target/release/package-json-upgrade-lsp" } } }
 ```
 
 ## Settings
