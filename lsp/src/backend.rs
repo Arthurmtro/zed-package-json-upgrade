@@ -99,14 +99,14 @@ impl Backend {
                 continue;
             }
             let kind = upgrade_kind(current_pinned(&dep.range_str).as_ref(), latest);
-            let (severity, label) = match kind {
-                "major" => (DiagnosticSeverity::ERROR, "Major"),
-                "minor" => (DiagnosticSeverity::WARNING, "Minor"),
-                _ => (DiagnosticSeverity::HINT, "Patch"),
+            let label = match kind {
+                "major" => "Major",
+                "minor" => "Minor",
+                _ => "Patch",
             };
             out.push(Diagnostic {
                 range: dep.value_range,
-                severity: Some(severity),
+                severity: Some(DiagnosticSeverity::HINT),
                 code: Some(NumberOrString::String(format!("upgrade-{kind}:{}", dep.name))),
                 source: Some("package-json-upgrade".into()),
                 message: format!("{label} update available: {} → {latest}", dep.range_str),
@@ -145,18 +145,24 @@ impl Backend {
             if version_ignored(&dep.name, latest, &settings) {
                 continue;
             }
+            let kind = upgrade_kind(current_pinned(&dep.range_str).as_ref(), latest);
+            let marker = match kind {
+                "major" => "🔴",
+                "minor" => "🟡",
+                _ => "🟢",
+            };
             let pos = Position {
                 line: dep.value_range.end.line,
                 character: dep.value_range.end.character.saturating_add(1),
             };
             hints.push(InlayHint {
                 position: pos,
-                label: InlayHintLabel::String(format!(" → {latest}")),
+                label: InlayHintLabel::String(format!(" {marker} {latest}")),
                 kind: Some(InlayHintKind::TYPE),
                 text_edits: None,
                 tooltip: Some(InlayHintTooltip::String(format!(
-                    "{} latest: {}",
-                    dep.name, latest
+                    "{} {} update available — latest: {}",
+                    dep.name, kind, latest
                 ))),
                 padding_left: Some(true),
                 padding_right: None,

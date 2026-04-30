@@ -5,11 +5,14 @@ Inspired by the VS Code extension [`package-json-upgrade`](https://marketplace.v
 
 Features:
 
-- **Inlay hint** `→ <latest>` after each outdated dependency version.
-- **Diagnostics** (severity scales with the size of the upgrade):
-  - `Error` (red) — invalid semver, or a major version is available.
-  - `Warning` (yellow) — package missing from the npm registry, or a minor version is available.
-  - `Hint` — patch update available (sidebar marker only, no underline).
+- **Inlay hint** after each outdated dependency, color-coded by upgrade size:
+  - 🔴 major behind
+  - 🟡 minor behind
+  - 🟢 patch behind
+- **Diagnostics**:
+  - `Error` (red squiggle) — invalid semver in the version string.
+  - `Warning` (yellow squiggle) — package not found in the npm registry.
+  - `Hint` (no squiggle, sidebar marker only) — outdated dependency. The full upgrade tier is encoded in the inlay hint emoji, not in the diagnostic, so the file stays free of squiggle noise on perfectly valid but outdated deps.
 - **Completions** inside the version string: typing `^`, `~`, `.`, or `"` lists the available versions for that package, with `latest` tagged.
 - **Hover** on a version string shows the package description, latest version, license, homepage, and changelog link.
 - **Quick-fix code actions** (Zed default `cmd-.` / `ctrl-.`):
