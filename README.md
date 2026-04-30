@@ -21,7 +21,7 @@ The "outdated" check compares the literal pinned version (the `X.Y.Z` written in
   - **Do patch / minor / major upgrade to `<latest>`**
   - **Open homepage**
   - **Open changelog**
-  - **Update all dependencies** (document-wide quick-fix)
+  - **Update all dependencies (patch / minor / major)** (document-wide quick-fix; pick the safety tier you want)
 - **Parallel registry prefetch** on open/change with a per-process concurrency cap (8 in-flight requests). Subsequent code actions, hovers, and completions are served from a 1-hour in-memory cache.
 
 ## Architecture

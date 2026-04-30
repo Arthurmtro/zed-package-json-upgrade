@@ -160,36 +160,19 @@ impl Backend {
         latest: &Version,
     ) -> Vec<CodeActionOrCommand> {
         let (prefix, _) = split_prefix(&dep.range_str);
-        let current = current_pinned(&dep.range_str);
-
-        let stable: Vec<&Version> = versions.iter().filter(|v| !v.is_prerelease()).collect();
-
-        let pick = |kind: &str| -> Option<&Version> {
-            let cur = current.as_ref()?;
-            match kind {
-                "patch" => stable
-                    .iter()
-                    .find(|v| v.major == cur.major && v.minor == cur.minor && **v > cur)
-                    .copied(),
-                "minor" => stable
-                    .iter()
-                    .find(|v| v.major == cur.major && **v > cur)
-                    .copied(),
-                "major" => stable.first().copied(),
-                _ => None,
-            }
+        let Some(current) = current_pinned(&dep.range_str) else {
+            return Vec::new();
         };
-
         let mut emitted: Vec<String> = Vec::new();
         let mut actions = Vec::new();
-        let preferred_kind = upgrade_kind(current.as_ref(), latest);
+        let preferred_kind = upgrade_kind(Some(&current), latest);
 
         for kind in ["patch", "minor", "major"] {
-            let Some(target) = pick(kind) else { continue };
-            if let Some(cur) = current.as_ref() {
-                if target <= cur {
-                    continue;
-                }
+            let Some(target) = pick_tier_target(versions, &current, kind) else {
+                continue;
+            };
+            if target <= current {
+                continue;
             }
             let target_str = target.to_string();
             if emitted.contains(&target_str) {
@@ -462,16 +445,26 @@ impl LanguageServer for Backend {
             }
         }
 
-        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-            title: "Update all dependencies".into(),
-            kind: Some(CodeActionKind::new("source.package-json-upgrade.updateAll")),
-            command: Some(Command {
-                title: "Update all dependencies".into(),
-                command: CMD_UPDATE_ALL.into(),
-                arguments: Some(vec![Value::String(uri.to_string())]),
-            }),
-            ..Default::default()
-        }));
+        for tier in ["patch", "minor", "major"] {
+            let title = match tier {
+                "patch" => "Update all dependencies (patch)",
+                "minor" => "Update all dependencies (minor)",
+                _ => "Update all dependencies (major)",
+            };
+            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title: title.into(),
+                kind: Some(CodeActionKind::new("source.package-json-upgrade.updateAll")),
+                command: Some(Command {
+                    title: title.into(),
+                    command: CMD_UPDATE_ALL.into(),
+                    arguments: Some(vec![
+                        Value::String(uri.to_string()),
+                        Value::String(tier.into()),
+                    ]),
+                }),
+                ..Default::default()
+            }));
+        }
 
         Ok(Some(actions))
     }
@@ -495,8 +488,13 @@ impl LanguageServer for Backend {
                 Ok(None)
             }
             CMD_UPDATE_ALL => {
-                let Some(Value::String(uri_s)) = params.arguments.into_iter().next() else {
+                let mut args = params.arguments.into_iter();
+                let Some(Value::String(uri_s)) = args.next() else {
                     return Ok(None);
+                };
+                let tier = match args.next() {
+                    Some(Value::String(s)) => s,
+                    _ => "major".to_string(),
                 };
                 let Ok(uri) = Url::parse(&uri_s) else {
                     return Ok(None);
@@ -519,20 +517,22 @@ impl LanguageServer for Backend {
                     if pkg.status != PackageStatus::Found {
                         continue;
                     }
-                    let Some(latest) = pkg.latest else { continue };
                     let Some(current) = current_pinned(&dep.range_str) else {
                         continue;
                     };
-                    if current >= latest {
+                    let Some(target) = pick_tier_target(&pkg.versions, &current, &tier) else {
+                        continue;
+                    };
+                    if target <= current {
                         continue;
                     }
-                    if version_ignored(&dep.name, &latest, &settings) {
+                    if version_ignored(&dep.name, &target, &settings) {
                         continue;
                     }
                     let (prefix, _) = split_prefix(&dep.range_str);
                     edits.push(TextEdit {
                         range: dep.value_range,
-                        new_text: format!("{prefix}{latest}"),
+                        new_text: format!("{prefix}{target}"),
                     });
                 }
                 if !edits.is_empty() {
@@ -604,5 +604,19 @@ fn version_ignored(name: &str, version: &Version, settings: &Settings) -> bool {
 
 fn str_starts_with(haystack: &str, needle: &str) -> bool {
     needle.is_empty() || haystack.starts_with(needle)
+}
+
+fn pick_tier_target(versions: &[Version], current: &Version, tier: &str) -> Option<Version> {
+    let mut stable = versions.iter().filter(|v| !v.is_prerelease());
+    match tier {
+        "patch" => stable
+            .find(|v| v.major == current.major && v.minor == current.minor && *v > current)
+            .cloned(),
+        "minor" => stable
+            .find(|v| v.major == current.major && *v > current)
+            .cloned(),
+        "major" => stable.next().cloned(),
+        _ => None,
+    }
 }
 
