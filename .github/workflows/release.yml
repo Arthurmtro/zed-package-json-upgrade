@@ -44,9 +44,9 @@ jobs:
           set -euo pipefail
           arch="${{ matrix.target }}"
           stem="package-json-upgrade-lsp-${arch%%-*}-${arch#*-}"
-          mkdir -p dist/$stem
-          cp lsp/target/${{ matrix.target }}/release/package-json-upgrade-lsp dist/$stem/
-          tar -C dist -czf dist/$stem.tar.gz $stem
+          mkdir -p dist
+          tar -C lsp/target/${{ matrix.target }}/release \
+              -czf dist/$stem.tar.gz package-json-upgrade-lsp
           ls -la dist/
 
       - name: Package (zip)
@@ -56,9 +56,10 @@ jobs:
           $arch = "${{ matrix.target }}"
           $parts = $arch -split '-', 2
           $stem  = "package-json-upgrade-lsp-$($parts[0])-$($parts[1])"
-          New-Item -ItemType Directory -Force -Path "dist/$stem" | Out-Null
-          Copy-Item "lsp/target/${{ matrix.target }}/release/package-json-upgrade-lsp.exe" "dist/$stem/"
-          Compress-Archive -Path "dist/$stem" -DestinationPath "dist/$stem.zip"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive `
+              -Path "lsp/target/${{ matrix.target }}/release/package-json-upgrade-lsp.exe" `
+              -DestinationPath "dist/$stem.zip"
           Get-ChildItem dist
 
       - uses: actions/upload-artifact@v4
