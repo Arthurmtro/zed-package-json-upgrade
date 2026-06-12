@@ -72,7 +72,7 @@ The colored markers (`🔴 25.6.0`, `⚠ 1h`, …) are LSP inlay hints. Zed defa
 }
 ```
 
-This scopes inlay hints to JSON / JSONC buffers. Zed's built-in `json-language-server` does not emit inlay hints, so in practice the only extension this affects is `package-json-upgrade`.
+This scopes inlay hints to JSON / JSONC buffers. Zed's built-in `json-language-server` does not emit inlay hints, so in practice the only extension this affects is `package-json-upgrade-lsp`.
 
 The diagnostics, hovers, and code actions work without any inlay-hint config — they're standard LSP features.
 
@@ -111,16 +111,16 @@ In Zed `settings.json`:
 1. Tag the repo (`git tag v0.0.1 && git push --tags`). The release workflow builds and uploads LSP binaries for macOS (arm64+x64), Linux (arm64+x64) and Windows (x64).
 2. Bump `version` in `extension.toml` to match the tag.
 3. Fork [`zed-industries/extensions`](https://github.com/zed-industries/extensions).
-4. `git submodule add https://github.com/Arthurmtro/zed-package-json-upgrade.git extensions/package-json-upgrade`
+4. `git submodule add https://github.com/Arthurmtro/zed-package-json-upgrade.git extensions/package-json-upgrade-lsp`
 5. Add to `extensions.toml`:
    ```toml
-   [package-json-upgrade]
-   submodule = "extensions/package-json-upgrade"
+   [package-json-upgrade-lsp]
+   submodule = "extensions/package-json-upgrade-lsp"
    version = "0.0.1"
    ```
 6. `pnpm sort-extensions`, commit, open PR.
 
-For subsequent updates: `git submodule update --remote extensions/package-json-upgrade` then bump `version` in `extensions.toml`.
+For subsequent updates: `git submodule update --remote extensions/package-json-upgrade-lsp` then bump `version` in `extensions.toml`.
 
 ## License
 
